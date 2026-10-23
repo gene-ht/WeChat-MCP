@@ -14,13 +14,13 @@ from ApplicationServices import (
 )
 
 from .logging_config import logger
+from .ui import long_press_element_center
 from .wechat_accessibility import (
     _find_window_by_title,
     _wait_for_window,
     click_element_center,
     dfs,
     get_wechat_ax_app,
-    long_press_element_center,
 )
 
 

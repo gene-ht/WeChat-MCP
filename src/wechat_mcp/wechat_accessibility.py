@@ -1,101 +1,321 @@
+"""WeChat for macOS: process discovery, windows, chat navigation and search.
+
+This module is the only place that knows WeChat's Accessibility structure
+(session list identifiers, search sections, window titles). Low-level AX
+primitives live in :mod:`wechat_mcp.ax`; synthetic input lives in
+:mod:`wechat_mcp.ui`.
+
+Focus policy
+------------
+Reading attributes does not require WeChat to be frontmost, so read-only
+helpers accept ``activate=False``. Anything that clicks, scrolls or types is
+posted to the HID tap and therefore *does* require WeChat to be frontmost;
+those paths call :func:`ensure_frontmost` explicitly and fail loudly instead of
+acting on whatever window happens to be on top.
+"""
+
 from __future__ import annotations
 
 import re
+import subprocess
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 import AppKit
 from ApplicationServices import (
     AXUIElementCreateApplication,
-    AXUIElementCopyAttributeValue,
     AXUIElementPerformAction,
     AXUIElementSetAttributeValue,
-    AXValueGetType,
-    AXValueGetValue,
     kAXChildrenAttribute,
     kAXIdentifierAttribute,
     kAXListRole,
     kAXPositionAttribute,
     kAXRaiseAction,
     kAXRoleAttribute,
-    kAXSizeAttribute,
     kAXStaticTextRole,
     kAXTextAreaRole,
     kAXTitleAttribute,
     kAXValueAttribute,
-    kAXValueCGPointType,
-    kAXValueCGSizeType,
     kAXWindowRole,
-)
-from Quartz import (
-    CGEventCreateKeyboardEvent,
-    CGEventCreateMouseEvent,
-    CGEventCreateScrollWheelEvent,
-    CGEventPost,
-    CGEventSetFlags,
-    CGEventSetLocation,
-    CGPoint,
-    kCGEventFlagMaskCommand,
-    kCGEventLeftMouseDown,
-    kCGEventLeftMouseUp,
-    kCGHIDEventTap,
-    kCGScrollEventUnitLine,
+    kAXWindowsAttribute,
 )
 
+from .ax import (
+    ax_get,
+    axvalue_to_point,
+    dfs,
+    element_center,
+    walk,
+)
+from .errors import (
+    ChatOpenFailed,
+    WeChatMCPError,
+    WeChatNotRunning,
+    WeChatUIUnavailable,
+)
 from .logging_config import logger
+from .pacing import pause, wait_until
+from .ui import (
+    click_element_center,
+    post_scroll,
+    press_paste,
+    press_select_all,
+)
+
+WECHAT_BUNDLE_ID = "com.tencent.xinWeChat"
+
+# Re-exported for callers that used to import these from this module.
+__all__ = [
+    "WECHAT_BUNDLE_ID",
+    "SearchEntry",
+    "ax_get",
+    "axvalue_to_point",
+    "click_element_center",
+    "collect_chat_elements",
+    "dfs",
+    "ensure_frontmost",
+    "find_chat_element_by_name",
+    "find_search_field",
+    "focus_and_type_search",
+    "get_current_chat_name",
+    "get_list_center",
+    "get_search_list",
+    "get_wechat_ax_app",
+    "is_wechat_frontmost",
+    "is_wechat_running",
+    "open_chat_for_contact",
+    "post_scroll",
+]
 
 
-def ax_get(element, attribute):
-    err, value = AXUIElementCopyAttributeValue(element, attribute, None)
-    if err != 0:
-        return None
-    return value
-
-
-def dfs(element, predicate: Callable[[Any, Any, Any, Any], bool]):
-    if element is None:
-        return None
-
-    role = ax_get(element, kAXRoleAttribute)
-    title = ax_get(element, kAXTitleAttribute)
-    identifier = ax_get(element, kAXIdentifierAttribute)
-
-    if predicate(element, role, title, identifier):
-        return element
-
-    children = ax_get(element, kAXChildrenAttribute) or []
-    for child in children:
-        found = dfs(child, predicate)
-        if found is not None:
-            return found
-    return None
-
-
-def get_wechat_ax_app() -> Any:
-    """
-    Get the AX UI element representing the WeChat application and bring
-    it to the foreground.
-    """
-    bundle_id = "com.tencent.xinWeChat"
+# --------------------------------------------------------------------- app
+def _running_wechat_app() -> Any | None:
     apps = AppKit.NSRunningApplication.runningApplicationsWithBundleIdentifier_(
-        bundle_id
+        WECHAT_BUNDLE_ID
     )
-    if not apps:
-        raise RuntimeError("WeChat is not running")
+    return apps[0] if apps else None
 
-    app = apps[0]
-    app.activateWithOptions_(AppKit.NSApplicationActivateIgnoringOtherApps)
-    logger.info(
-        "Activated WeChat (bundle_id=%s, pid=%s)", bundle_id, app.processIdentifier()
+
+def is_wechat_running() -> bool:
+    return _running_wechat_app() is not None
+
+
+def is_wechat_frontmost() -> bool:
+    """Return ``True`` if WeChat is the active application."""
+    frontmost = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+    if frontmost is None:
+        return False
+    return frontmost.bundleIdentifier() == WECHAT_BUNDLE_ID
+
+
+def _activate_via_applescript(timeout: float = 3.0) -> bool:
+    """Activate WeChat through AppleScript.
+
+    macOS throttles ``NSRunningApplication.activate`` for background callers
+    (measured: no focus change even after 30 s). Sending an Apple Event to the
+    app itself is not throttled, so this is the reliable fallback.
+    """
+    try:
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                f'tell application id "{WECHAT_BUNDLE_ID}" to activate',
+            ],
+            check=False,
+            capture_output=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("AppleScript activation failed: %s", exc)
+        return False
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if is_wechat_frontmost():
+            return True
+        time.sleep(0.15)
+    return False
+
+
+def frontmost_app() -> Any | None:
+    """Return the currently active application, if any."""
+    return AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+
+
+@contextmanager
+def preserve_focus(enabled: bool = True):
+    """Restore the app that was active before a tool call.
+
+    A tool call may need WeChat in front to click or type. Without this guard
+    the user is left staring at WeChat after every call; with it, focus returns
+    to wherever they were. Restoring is skipped when WeChat was already active.
+    """
+    previous = frontmost_app() if enabled else None
+    try:
+        yield
+    finally:
+        should_restore = (
+            previous is not None
+            and previous.bundleIdentifier() != WECHAT_BUNDLE_ID
+            and is_wechat_frontmost()
+        )
+        if should_restore:
+            try:
+                previous.activateWithOptions_(
+                    AppKit.NSApplicationActivateIgnoringOtherApps
+                )
+                time.sleep(0.15)
+            except Exception as exc:  # pragma: no cover - best effort
+                logger.debug("Could not restore focus to %s: %s", previous, exc)
+
+
+def ensure_frontmost(timeout: float = 8.0) -> None:
+    """Activate WeChat and wait until it owns the keyboard focus.
+
+    Qt-based WeChat 4.x can take several seconds to come forward, and macOS
+    throttles repeated activation requests, so activation is retried instead of
+    being issued once. ``open -b`` (LaunchServices) is used as a fallback when
+    the first two seconds pass without focus.
+
+    Raises:
+        WeChatNotRunning: WeChat is not running.
+        ChatOpenFailed: WeChat did not become frontmost within ``timeout``.
+    """
+    app = _running_wechat_app()
+    if app is None:
+        raise WeChatNotRunning("WeChat is not running")
+
+    if is_wechat_frontmost():
+        return
+
+    started = time.time()
+    options = (
+        AppKit.NSApplicationActivateAllWindows
+        | AppKit.NSApplicationActivateIgnoringOtherApps
     )
-    return AXUIElementCreateApplication(app.processIdentifier())
+    used_applescript = False
+
+    while time.time() - started < timeout:
+        if not used_applescript:
+            app.activateWithOptions_(options)
+        else:
+            time.sleep(0.2)
+
+        for _ in range(6):
+            time.sleep(0.1)
+            if is_wechat_frontmost():
+                logger.debug(
+                    "WeChat became frontmost after %.2fs", time.time() - started
+                )
+                return
+
+        if not used_applescript and time.time() - started >= 1.2:
+            used_applescript = True
+            logger.info("Direct activation did not take; using AppleScript")
+            if _activate_via_applescript(timeout=max(1.0, timeout - 2.0)):
+                return
+
+    raise ChatOpenFailed(
+        "WeChat did not become the frontmost application; refusing to send "
+        "synthetic input that could land in another window.",
+        waited_seconds=round(time.time() - started, 1),
+    )
 
 
+def get_wechat_ax_app(*, activate: bool = True) -> Any:
+    """Return the AX root element for WeChat.
+
+    Args:
+        activate: bring WeChat to the foreground first. Keep ``True`` for any
+            path that clicks, scrolls or types; use ``False`` for read-only
+            inspection so the agent does not steal focus.
+    """
+    app = _running_wechat_app()
+    if app is None:
+        raise WeChatNotRunning("WeChat is not running")
+
+    if activate:
+        was_frontmost = is_wechat_frontmost()
+        ensure_frontmost()
+        if not was_frontmost:
+            # Qt needs a moment to build its AX tree after coming forward.
+            pause(1.0, minimum=0.4)
+
+    pid = app.processIdentifier()
+    logger.debug("Using WeChat AX app (pid=%s, activate=%s)", pid, activate)
+    return AXUIElementCreateApplication(pid)
+
+
+# ------------------------------------------------------------- diagnostics
+AX_TREE_MIN_ELEMENTS = 15
+
+
+def wechat_app_version() -> str | None:
+    """Return WeChat's bundle version, e.g. ``"4.1.4"``."""
+    app = _running_wechat_app()
+    if app is None:
+        return None
+    bundle = AppKit.NSBundle.bundleWithURL_(app.bundleURL())
+    if bundle is None:
+        return None
+    version = bundle.infoDictionary().get("CFBundleShortVersionString")
+    return str(version) if version else None
+
+
+def ax_tree_stats(ax_app: Any | None = None) -> dict[str, Any]:
+    """Count the AX elements WeChat currently exposes.
+
+    WeChat 4.1.x on recent macOS releases sometimes exposes only the window
+    frame (three traffic-light buttons) and no chat UI. Detecting that early
+    produces a clear error instead of "could not find the search field".
+    """
+    ax_app = ax_app or get_wechat_ax_app(activate=False)
+    windows = ax_get(ax_app, kAXWindowsAttribute) or []
+
+    count = 0
+
+    def visit(node: Any, depth: int) -> None:
+        nonlocal count
+        if node is None or count > 250 or depth > 6:
+            return
+        count += 1
+        for child in ax_get(node, kAXChildrenAttribute) or []:
+            visit(child, depth + 1)
+
+    for window in windows:
+        visit(window, 0)
+
+    return {
+        "window_count": len(windows),
+        "element_count": count,
+        "ok": count >= AX_TREE_MIN_ELEMENTS,
+        "version": wechat_app_version(),
+    }
+
+
+def ensure_ax_tree_available(ax_app: Any | None = None) -> dict[str, Any]:
+    """Raise :class:`WeChatUIUnavailable` when WeChat exposes no chat UI."""
+    stats = ax_tree_stats(ax_app)
+    if not stats["ok"]:
+        raise WeChatUIUnavailable(
+            "WeChat is running but only exposes its window frame through the "
+            "Accessibility API (no sidebar, message list or input field). "
+            "WeChat 4.1.x on recent macOS releases is known to break AX-based "
+            "automation; use WeChat 3.8.x, or drive the client with the "
+            "keyboard/OCR fallback until a compatible client is available.",
+            element_count=stats["element_count"],
+            window_count=stats["window_count"],
+            wechat_version=stats["version"],
+        )
+    return stats
+
+
+# ------------------------------------------------------------------ windows
 def _find_window_by_title(ax_app: Any, title: str):
-    """
-    Locate a top-level WeChat window with the given title.
-    """
+    """Locate a top-level WeChat window with the given title."""
 
     def is_window(el, role, current_title, identifier):
         return (
@@ -108,10 +328,7 @@ def _find_window_by_title(ax_app: Any, title: str):
 
 
 def _wait_for_window(ax_app: Any, title: str, timeout: float = 5.0):
-    """
-    Wait for a window with the given title to appear, returning the AX
-    element or None if the timeout expires.
-    """
+    """Wait until a window with ``title`` appears, returning it or ``None``."""
     end = time.time() + timeout
     while time.time() < end:
         window = _find_window_by_title(ax_app, title)
@@ -123,25 +340,17 @@ def _wait_for_window(ax_app: Any, title: str, timeout: float = 5.0):
     return None
 
 
+# ------------------------------------------------------------------- chats
 def _normalize_chat_title(name: str) -> str:
-    """
-    Normalize a WeChat chat title.
-
-    In particular, strip a trailing "(<digits>)" suffix that WeChat
-    appends for group chats to indicate member count, e.g.:
-    "My Group(23)" -> "My Group".
-    """
+    """Strip the trailing ``"(<member count>)"`` suffix WeChat adds to groups."""
     name = name.strip()
-    # Remove trailing "(number)" if present.
     name = re.sub(r"\(\d+\)$", "", name).strip()
     return name
 
 
 def get_current_chat_name() -> str | None:
-    """
-    Return the display name of the currently open chat, if available.
-    """
-    ax_app = get_wechat_ax_app()
+    """Return the display name of the currently open chat, if available."""
+    ax_app = get_wechat_ax_app(activate=False)
 
     def is_chat_title(el, role, title, identifier):
         return role == kAXStaticTextRole and identifier == "big_title_line_h_view"
@@ -163,108 +372,44 @@ def get_current_chat_name() -> str | None:
 
 
 def collect_chat_elements(ax_app) -> dict[str, Any]:
-    """
-    Collect chat elements from the left session list keyed by display name.
-    """
+    """Collect chat elements from the left session list keyed by display name."""
     results: dict[str, Any] = {}
 
-    def walk(element):
+    def visit(element):
         role = ax_get(element, kAXRoleAttribute)
         identifier = ax_get(element, kAXIdentifierAttribute)
-        if isinstance(role, str) and role == kAXStaticTextRole:
-            if isinstance(identifier, str) and identifier.startswith("session_item_"):
-                chat_name = identifier[len("session_item_") :]
-                if chat_name:
-                    results[chat_name] = element
+        if (
+            isinstance(role, str)
+            and role == kAXStaticTextRole
+            and isinstance(identifier, str)
+            and identifier.startswith("session_item_")
+        ):
+            chat_name = identifier[len("session_item_") :]
+            if chat_name:
+                results[chat_name] = element
 
-        children = ax_get(element, kAXChildrenAttribute) or []
-        for child in children:
-            walk(child)
-
-    walk(ax_app)
-    logger.info("Collected %d chat elements from session list", len(results))
+    walk(ax_app, visit, max_depth=12)
+    logger.debug("Collected %d chat elements from session list", len(results))
     return results
 
 
+def list_chat_names() -> list[str]:
+    """Return the chat names currently visible in the session list."""
+    ax_app = get_wechat_ax_app(activate=False)
+    return sorted(collect_chat_elements(ax_app))
+
+
 def find_chat_element_by_name(ax_app, chat_name: str):
-    """
-    Find a chat element whose name matches the given chat name exactly
-    (case-sensitive and case-insensitive match are both attempted).
-    """
+    """Find a session-list element by exact name (case-insensitive fallback)."""
     chat_elements = collect_chat_elements(ax_app)
     if chat_name in chat_elements:
         return chat_elements[chat_name]
 
     lowered = {name.lower(): el for name, el in chat_elements.items()}
-    match = lowered.get(chat_name.lower())
-    if match is not None:
-        return match
-    return None
+    return lowered.get(chat_name.lower())
 
 
-def send_key_with_modifiers(keycode: int, flags: int):
-    event_down = CGEventCreateKeyboardEvent(None, keycode, True)
-    CGEventSetFlags(event_down, flags)
-    event_up = CGEventCreateKeyboardEvent(None, keycode, False)
-    CGEventSetFlags(event_up, flags)
-    CGEventPost(kCGHIDEventTap, event_down)
-    CGEventPost(kCGHIDEventTap, event_up)
-
-
-def click_element_center(element) -> None:
-    """
-    Synthesize a left mouse click at the visual center of the element.
-    """
-    pos_ref = ax_get(element, kAXPositionAttribute)
-    size_ref = ax_get(element, kAXSizeAttribute)
-    point = axvalue_to_point(pos_ref)
-    size = axvalue_to_size(size_ref)
-    if point is None or size is None:
-        raise RuntimeError("Failed to get bounds for element to click")
-
-    x, y = point
-    w, h = size
-    cx = x + w / 2.0
-    cy = y + h / 2.0
-
-    event_down = CGEventCreateMouseEvent(
-        None, kCGEventLeftMouseDown, CGPoint(cx, cy), 0
-    )
-    event_up = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, CGPoint(cx, cy), 0)
-    CGEventPost(kCGHIDEventTap, event_down)
-    CGEventPost(kCGHIDEventTap, event_up)
-
-
-def long_press_element_center(element, hold_seconds: float = 2.2) -> None:
-    """
-    Synthesize a long left mouse press at the visual center of the
-    given element.
-    """
-    pos_ref = ax_get(element, kAXPositionAttribute)
-    size_ref = ax_get(element, kAXSizeAttribute)
-    point = axvalue_to_point(pos_ref)
-    size = axvalue_to_size(size_ref)
-    if point is None or size is None:
-        raise RuntimeError("Failed to get bounds for element to long-press")
-
-    x, y = point
-    w, h = size
-    cx = x + w / 2.0
-    cy = y + h / 2.0
-
-    event_down = CGEventCreateMouseEvent(
-        None, kCGEventLeftMouseDown, CGPoint(cx, cy), 0
-    )
-    CGEventPost(kCGHIDEventTap, event_down)
-    try:
-        time.sleep(max(0.0, hold_seconds))
-    finally:
-        event_up = CGEventCreateMouseEvent(
-            None, kCGEventLeftMouseUp, CGPoint(cx, cy), 0
-        )
-        CGEventPost(kCGHIDEventTap, event_up)
-
-
+# ------------------------------------------------------------------ search
 def find_search_field(ax_app):
     def is_search(el, role, title, identifier):
         return role == kAXTextAreaRole and title == "Search"
@@ -277,124 +422,107 @@ def find_search_field(ax_app):
     return search
 
 
-def focus_and_type_search(ax_app, text: str):
-    """
-    Focus the WeChat sidebar search field and type the given text using
-    Command+A and Command+V
-    """
+def focus_and_type_search(ax_app, text: str) -> None:
+    """Focus the sidebar search field and replace its contents with ``text``."""
     search = find_search_field(ax_app)
-
     AXUIElementPerformAction(search, kAXRaiseAction)
+    pause(0.4, minimum=0.2)
 
     # Clear any existing value via AX (best effort).
     err = AXUIElementSetAttributeValue(search, kAXValueAttribute, "")
     if err != 0:
         logger.debug("Failed to clear search field via AX (err=%s)", err)
 
-    pb = AppKit.NSPasteboard.generalPasteboard()
-    pb.clearContents()
-    pb.setString_forType_(text, AppKit.NSPasteboardTypeString)
+    # Clipboard paste is IME-safe for Chinese input.
+    from .ui import set_clipboard_text
 
-    time.sleep(0.1)
+    set_clipboard_text(text)
+    pause(0.3, minimum=0.15)
+    press_select_all()
+    pause(0.2, minimum=0.1)
+    press_paste()
+    pause(0.5, minimum=0.25)
 
-    keycode_a = 0  # US keyboard 'A'
-    keycode_v = 9  # US keyboard 'V'
-    send_key_with_modifiers(keycode_a, kCGEventFlagMaskCommand)
-    time.sleep(0.05)
-    send_key_with_modifiers(keycode_v, kCGEventFlagMaskCommand)
+
+def _wait_for_chat_title(chat_name: str, timeout: float = 3.0) -> bool:
+    """Wait until ``chat_name`` is the active conversation."""
+
+    def is_target() -> bool:
+        current = get_current_chat_name()
+        return bool(current) and current.strip().casefold() == chat_name.strip().casefold()
+
+    matched = wait_until(is_target, timeout=timeout, interval=0.3)
+    if not matched:
+        logger.warning("Chat %r did not become the active conversation in time", chat_name)
+    return matched
 
 
 def open_chat_for_contact(chat_name: str) -> dict[str, Any] | None:
-    """
-    Open a chat for a given name (contact or group).
+    """Open a chat for a given name (contact or group).
 
-    First, search in the left sidebar session list. If found, click it.
-    If not, type the name into the global search field and inspect the
-    search results:
-    - Prefer an exact match under the "Contacts" section.
-    - Otherwise, prefer an exact match under the "Group Chats" section.
-    - If no exact match is visible, expand "View All" for Contacts and
-      Group Chats (if present) and scroll through results, looking for
-      an exact match while explicitly ignoring the "Chat History", "Official Accounts", "Internet search results", and "More" sections.
+    First, search the left sidebar session list. If found, click it. If not,
+    type the name into the global search field and inspect the results:
 
-    If no exact match can be found, this function does **not** fall back
-    to the top search result. Instead, it returns a dict of the form:
+    - Prefer an exact match under "Contacts".
+    - Otherwise, prefer an exact match under "Group Chats".
+    - If no exact match is visible, expand "View All" for Contacts and Group
+      Chats (if present) and scroll through results, ignoring "Chat History",
+      "Official Accounts", "Internet search results" and "More".
 
-    {
-        "error": "<LLM-friendly message>",
-        "chat_name": "<original chat_name>",
-        "candidates": {
-            "contacts": [... up to 15 names ...],
-            "group_chats": [... up to 15 names ...],
-        },
-    }
-
-    Callers can use this to ask the LLM to choose a more specific target.
+    Returns ``None`` on success, or a dict with ``error`` and ``candidates``
+    when no exact match exists. Callers may surface the candidates to the LLM.
     """
     logger.info("Opening chat for name: %s", chat_name)
-    ax_app = get_wechat_ax_app()
+    ax_app = get_wechat_ax_app(activate=True)
+    ensure_ax_tree_available(ax_app)
+
+    # The session list is virtualised and can still be empty right after the
+    # window comes forward; give the client a chance to render it.
+    if not wait_until(lambda: bool(collect_chat_elements(ax_app)), timeout=4.0):
+        logger.warning("Session list is still empty after waiting; falling back to search")
 
     element = find_chat_element_by_name(ax_app, chat_name)
     if element is not None:
         logger.info("Found chat in session list, clicking center")
         click_element_center(element)
-        time.sleep(0.3)
-        return
+        pause(1.0, minimum=0.4)
+        _wait_for_chat_title(chat_name)
+        return None
 
     logger.info("Chat not in session list, using global search")
     focus_and_type_search(ax_app, chat_name)
-    time.sleep(0.4)
+    pause(0.8, minimum=0.4)
 
-    try:
-        found, candidates = _select_contact_from_search_results(ax_app, chat_name)
-        if found:
-            logger.info("Opened chat for %s via search results", chat_name)
-            time.sleep(0.4)
-            return None
+    found, candidates = _select_contact_from_search_results(ax_app, chat_name)
+    if found:
+        logger.info("Opened chat for %s via search results", chat_name)
+        pause(1.0, minimum=0.4)
+        _wait_for_chat_title(chat_name)
+        return None
 
-        logger.info(
-            "Exact match for %s not found in Contacts/Group Chats search "
-            "results; returning candidate names",
-            chat_name,
-        )
-        error_msg = (
-            "Could not find an exact match for the requested chat name in "
-            "WeChat's Contacts or Group Chats search results. Returning "
-            "related contact and group names so the LLM can choose a more "
-            "specific chat to open."
-        )
-        logger.warning(
-            "open_chat_for_contact(%s) returning candidates instead of "
-            "opening a chat: %s",
-            chat_name,
-            error_msg,
-        )
-        return {
-            "error": error_msg,
-            "chat_name": chat_name,
-            "candidates": candidates,
-        }
-    except Exception as exc:
-        logger.exception(
-            "Error while selecting chat %s from search results: %s",
-            chat_name,
-            exc,
-        )
-        raise
+    logger.info(
+        "Exact match for %s not found in Contacts/Group Chats search results; "
+        "returning candidate names",
+        chat_name,
+    )
+    error_msg = (
+        "Could not find an exact match for the requested chat name in "
+        "WeChat's Contacts or Group Chats search results. Returning related "
+        "contact and group names so the LLM can choose a more specific chat "
+        "to open."
+    )
+    return {"error": error_msg, "chat_name": chat_name, "candidates": candidates}
 
 
 def get_search_list(ax_app):
-    """
-    Return the AX list that contains global search results in the
-    left sidebar (identifier: 'search_list').
-    """
+    """Return the AX list containing global search results (id: 'search_list')."""
 
     def is_search_list(el, role, title, identifier):
         return role == kAXListRole and identifier == "search_list"
 
     search_list = dfs(ax_app, is_search_list)
     if search_list is None:
-        raise RuntimeError(
+        raise WeChatMCPError(
             "Could not find WeChat search results list via Accessibility API"
         )
     return search_list
@@ -407,12 +535,18 @@ class SearchEntry:
     y: float
 
 
+SEARCH_SECTIONS = (
+    "Contacts",
+    "Group Chats",
+    "Chat History",
+    "Official Accounts",
+    "Internet search results",
+    "More",
+)
+
+
 def _collect_search_entries(search_list) -> list[SearchEntry]:
-    """
-    Collect visible static-text entries from the search results list,
-    including section headers, result cards and "View All"/"Collapse"
-    rows. Entries are sorted by vertical (Y) position.
-    """
+    """Collect visible static-text entries from the search results list."""
     entries: list[SearchEntry] = []
 
     def walk(el):
@@ -422,50 +556,30 @@ def _collect_search_entries(search_list) -> list[SearchEntry]:
             value = ax_get(el, kAXValueAttribute)
             text_obj = title if isinstance(title, str) and title else value
             if isinstance(text_obj, str):
-                pos_ref = ax_get(el, kAXPositionAttribute)
-                point = axvalue_to_point(pos_ref)
+                point = axvalue_to_point(ax_get(el, kAXPositionAttribute))
                 y = point[1] if point is not None else 0.0
                 entries.append(
-                    SearchEntry(
-                        element=el,
-                        text=text_obj.strip(),
-                        y=float(y),
-                    )
+                    SearchEntry(element=el, text=text_obj.strip(), y=float(y))
                 )
 
-        children = ax_get(el, kAXChildrenAttribute) or []
-        for child in children:
+        for child in ax_get(el, kAXChildrenAttribute) or []:
             walk(child)
 
     walk(search_list)
-    entries.sort(key=lambda e: e.y)
+    entries.sort(key=lambda entry: entry.y)
     return entries
 
 
 def _build_section_headers(entries: list[SearchEntry]) -> dict[str, float]:
-    """
-    Map known section titles ("Contacts", "Group Chats", "Chat History", "Official Accounts", "Internet search results", "More")
-    to their vertical Y coordinate within the search list.
-    """
     headers: dict[str, float] = {}
     for entry in entries:
-        if entry.text in (
-            "Contacts",
-            "Group Chats",
-            "Chat History",
-            "Official Accounts",
-            "Internet search results",
-            "More",
-        ):
+        if entry.text in SEARCH_SECTIONS:
             headers[entry.text] = entry.y
     return headers
 
 
 def _classify_section(entry: SearchEntry, headers: dict[str, float]) -> str | None:
-    """
-    Given an entry and the Y positions of section headers, determine which
-    section this entry belongs to by picking the last header above it.
-    """
+    """Return the last section header above ``entry``, if any."""
     section: str | None = None
     best_y = float("-inf")
     for title, header_y in headers.items():
@@ -476,15 +590,7 @@ def _classify_section(entry: SearchEntry, headers: dict[str, float]) -> str | No
 
 
 def _find_exact_match_in_entries(entries: list[SearchEntry], contact_name: str):
-    """
-    Look for an exact match in the current snapshot of search results.
-
-    Preference order:
-    - Exact match under "Contacts"
-    - Exact match under "Group Chats"
-
-    Entries classified as "Chat History", "Official Accounts", "Internet search results", or "More" are ignored.
-    """
+    """Look for an exact match, preferring Contacts over Group Chats."""
     target = contact_name.strip()
     headers = _build_section_headers(entries)
 
@@ -500,60 +606,29 @@ def _find_exact_match_in_entries(entries: list[SearchEntry], contact_name: str):
         elif section == "Group Chats" and group_element is None:
             group_element = entry.element
 
-    if contact_element is not None:
-        return contact_element
-    if group_element is not None:
-        return group_element
-    return None
+    return contact_element if contact_element is not None else group_element
 
 
-def _summarize_search_candidates(
-    entries: list[SearchEntry],
-) -> dict[str, list[str]]:
-    """
-    Summarize candidate names from search entries, grouped by section.
-
-    Returns up to 15 unique names from each of:
-    - "Contacts"
-    - "Group Chats"
-
-    Entries belonging to "Chat History", "Official Accounts", "Internet search results", or "More" are ignored.
-    """
+def _summarize_search_candidates(entries: list[SearchEntry]) -> dict[str, list[str]]:
+    """Summarize up to 15 candidate names from Contacts and Group Chats."""
     headers = _build_section_headers(entries)
     contacts: list[str] = []
     group_chats: list[str] = []
 
     for entry in entries:
-        # Skip section headers themselves.
-        if entry.text in (
-            "Contacts",
-            "Group Chats",
-            "Chat History",
-            "Official Accounts",
-            "Internet search results",
-            "More",
-        ):
+        if entry.text in SEARCH_SECTIONS:
             continue
-
         section = _classify_section(entry, headers)
-        if section == "Contacts":
-            if entry.text not in contacts:
-                contacts.append(entry.text)
-        elif section == "Group Chats":
-            if entry.text not in group_chats:
-                group_chats.append(entry.text)
+        if section == "Contacts" and entry.text not in contacts:
+            contacts.append(entry.text)
+        elif section == "Group Chats" and entry.text not in group_chats:
+            group_chats.append(entry.text)
 
-    return {
-        "contacts": contacts[:15],
-        "group_chats": group_chats[:15],
-    }
+    return {"contacts": contacts[:15], "group_chats": group_chats[:15]}
 
 
 def _expand_section_if_needed(search_list, section_title: str) -> None:
-    """
-    If a "View All(...)" row exists for the given section title
-    ("Contacts" or "Group Chats"), click its center to expand that section.
-    """
+    """Click a "View All(...)" row for ``section_title`` if present."""
     entries = _collect_search_entries(search_list)
     headers = _build_section_headers(entries)
     if section_title not in headers:
@@ -562,8 +637,7 @@ def _expand_section_if_needed(search_list, section_title: str) -> None:
     for entry in entries:
         if not entry.text.startswith("View All"):
             continue
-        section = _classify_section(entry, headers)
-        if section == section_title:
+        if _classify_section(entry, headers) == section_title:
             logger.info("Expanding %s section via %r", section_title, entry.text)
             click_element_center(entry.element)
             time.sleep(0.3)
@@ -573,11 +647,7 @@ def _expand_section_if_needed(search_list, section_title: str) -> None:
 def _select_contact_from_search_results(
     ax_app, contact_name: str
 ) -> tuple[bool, dict[str, list[str]]]:
-    """
-    Try to open a chat by selecting an exact match from the global
-    search results list, preferring Contacts over Group Chats and
-    ignoring the Chat History, Official Accounts, "Internet search results", and More sections.
-    """
+    """Open an exact match from search results, ignoring unsafe sections."""
     search_list = get_search_list(ax_app)
 
     aggregated_contacts: set[str] = set()
@@ -588,19 +658,21 @@ def _select_contact_from_search_results(
         aggregated_contacts.update(partial["contacts"])
         aggregated_groups.update(partial["group_chats"])
 
-    # First, inspect the initial compact search popover without scrolling.
+    def current_candidates() -> dict[str, list[str]]:
+        return {
+            "contacts": list(aggregated_contacts)[:15],
+            "group_chats": list(aggregated_groups)[:15],
+        }
+
+    # Inspect the compact search popover first, without scrolling.
     entries = _collect_search_entries(search_list)
     update_candidates(entries)
     element = _find_exact_match_in_entries(entries, contact_name)
     if element is not None:
         logger.info("Found exact match for %s in initial search results", contact_name)
         click_element_center(element)
-        return True, {
-            "contacts": list(aggregated_contacts)[:15],
-            "group_chats": list(aggregated_groups)[:15],
-        }
+        return True, current_candidates()
 
-    # No exact match visible yet; expand Contacts and Group Chats if possible.
     _expand_section_if_needed(search_list, "Contacts")
     _expand_section_if_needed(search_list, "Group Chats")
 
@@ -608,9 +680,6 @@ def _select_contact_from_search_results(
     last_bottom_text = None
     stable = 0
 
-    # Scroll through the expanded search list, looking for an
-    # exact match under Contacts/Group Chats, while aggregating
-    # candidate names from Contacts and Group Chats.
     for _ in range(80):
         entries = _collect_search_entries(search_list)
         update_candidates(entries)
@@ -622,14 +691,10 @@ def _select_contact_from_search_results(
                 contact_name,
             )
             click_element_center(element)
-            return True, {
-                "contacts": list(aggregated_contacts)[:15],
-                "group_chats": list(aggregated_groups)[:15],
-            }
+            return True, current_candidates()
 
-        children = ax_get(search_list, kAXChildrenAttribute) or []
         texts: list[str] = []
-        for child in children:
+        for child in ax_get(search_list, kAXChildrenAttribute) or []:
             txt = ax_get(child, kAXValueAttribute) or ax_get(child, kAXTitleAttribute)
             if isinstance(txt, str) and txt.strip():
                 texts.append(txt)
@@ -646,60 +711,15 @@ def _select_contact_from_search_results(
             last_bottom_text = new_last
             stable = 0
 
-        # Negative delta scrolls downwards through the search results list.
         post_scroll(center, -80)
         time.sleep(0.1)
 
-    return False, {
-        "contacts": list(aggregated_contacts)[:15],
-        "group_chats": list(aggregated_groups)[:15],
-    }
+    return False, current_candidates()
 
 
-def axvalue_to_point(ax_value):
-    if ax_value is None or AXValueGetType(ax_value) != kAXValueCGPointType:
-        return None
-    ok, cg_point = AXValueGetValue(ax_value, kAXValueCGPointType, None)
-    if not ok:
-        return None
-    return float(cg_point.x), float(cg_point.y)
-
-
-def axvalue_to_size(ax_value):
-    if ax_value is None or AXValueGetType(ax_value) != kAXValueCGSizeType:
-        return None
-    ok, cg_size = AXValueGetValue(ax_value, kAXValueCGSizeType, None)
-    if not ok:
-        return None
-    return float(cg_size.width), float(cg_size.height)
-
-
-def get_list_center(msg_list):
-    """
-    Compute the on-screen center point of the messages (or search) list,
-    used as the target for scroll-wheel events.
-    """
-    pos_ref = ax_get(msg_list, kAXPositionAttribute)
-    size_ref = ax_get(msg_list, kAXSizeAttribute)
-    origin = axvalue_to_point(pos_ref)
-    size = axvalue_to_size(size_ref)
-    if origin is None or size is None:
-        raise RuntimeError("Failed to get bounds for list element")
-
-    x, y = origin
-    w, h = size
-    return x + w / 2.0, y + h / 2.0
-
-
-def post_scroll(center, delta_lines: int) -> None:
-    """
-    Post a scroll-wheel event at the given screen position.
-
-    On a standard macOS configuration:
-    - Positive delta_lines scrolls towards older content (upwards in history).
-    - Negative delta_lines scrolls towards newer content (downwards in history).
-    """
-    cx, cy = center
-    event = CGEventCreateScrollWheelEvent(None, kCGScrollEventUnitLine, 1, delta_lines)
-    CGEventSetLocation(event, CGPoint(cx, cy))
-    CGEventPost(kCGHIDEventTap, event)
+def get_list_center(ax_list) -> tuple[float, float]:
+    """Compute the on-screen centre of a list, used for scroll events."""
+    center = element_center(ax_list)
+    if center is None:
+        raise WeChatMCPError("Failed to get bounds for list element")
+    return center

@@ -1,0 +1,30 @@
+# Long-history export.
+# Copy to artifacts/config/history.toml.
+
+[export]
+mode = "today"              # today | since | last_n
+days = 1
+
+[scroll]
+direction = "up"            # oldest-first walk, never reverses
+step = 12
+settle_seconds = 0.8
+retries = 2
+max_pages = 40              # per-run safety cap
+
+[stop]
+on_boundary = true          # stop at a separator older than the target day
+on_watermark = true         # stop at the stored watermark (3 contiguous rows)
+on_no_change = true         # stop when the view stops moving
+
+[merged_card]
+collect = true              # always collect in full; no "already collected" skip
+wait_seconds = 3.0          # let the popup render
+max_steps = 300             # runaway guard only
+click_mode = "bubble"
+verify_window = true
+
+[output]
+dir = "artifacts/chat-history"
+write_json = true
+write_txt = true

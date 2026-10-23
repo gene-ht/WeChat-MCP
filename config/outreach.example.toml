@@ -1,0 +1,43 @@
+# Outreach scripts — copy this file to config/outreach.toml and edit the copy.
+#
+# Template variables available in every string:
+#   {phone}        phone number of the lead ({identifier} still works)
+#   {name}         display name, if known
+#   {user_state}   free-form state, e.g. "求职"
+#   {channel}      channel key, e.g. "douyin_job"
+#   {channel_label} human label, e.g. "抖音-求职"
+# plus anything under [defaults] and [channels.<name>.vars].
+
+[defaults]
+company = "示例科技"
+recruiter = "招聘小助手"
+
+[channels.douyin_job]
+label = "抖音-求职"
+greeting = "你好，我是{company}的{recruiter}，在抖音看到你在找工作，方便加个好友聊两句吗？"
+followup = [
+  "你好呀，我是{company}的{recruiter}，刚通过好友。",
+  "方便说下你想找的岗位和期望城市吗？我这边帮你看看有没有合适的。",
+]
+
+[channels.douyin_job.vars]
+recruiter = "小王"
+
+[channels.wechat_job]
+label = "微信-求职"
+greeting = "你好，我是{company}的{recruiter}，朋友推荐说你在看{user_state}的机会，方便聊两句吗？"
+followup = [
+  "谢谢你通过～",
+  "我这边有几个{user_state}方向的岗位，方便发一份简历我帮你看看匹配度吗？",
+]
+
+[channels.douyin_partner]
+label = "抖音-渠道合作"
+greeting = "你好，我是{company}的{recruiter}，刷到你在做{user_state}相关的内容，想聊聊合作。"
+followup = [
+  "感谢通过！",
+  "我们最近在找{user_state}方向的合作方，方便约个时间简单聊下合作方式吗？",
+]
+
+[channels.douyin_partner.vars]
+recruiter = "小陈"

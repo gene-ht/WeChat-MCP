@@ -17,9 +17,10 @@ from ApplicationServices import (
 )
 
 from .logging_config import logger
+from .pacing import wait_until
 from .wechat_accessibility import (
-    _wait_for_window,
     _collect_search_entries,
+    _wait_for_window,
     ax_get,
     axvalue_to_point,
     click_element_center,
@@ -52,7 +53,7 @@ def _click_more_card_by_title(ax_app: Any, label: str) -> bool:
             time.sleep(0.4)
             return True
 
-    logger.warning("Did not find %r entry in search results", target)
+    logger.debug("Did not find %r entry in search results", target)
     return False
 
 
@@ -66,9 +67,7 @@ def _click_add_to_contacts_button(add_contacts_window) -> None:
             return False
         if identifier == "add_friend_button":
             return True
-        if isinstance(title, str) and title == "Add to Contacts":
-            return True
-        return False
+        return isinstance(title, str) and title == "Add to Contacts"
 
     button = dfs(add_contacts_window, is_add_button)
     if button is None:
@@ -288,14 +287,40 @@ def add_contact_by_wechat_id(
         focus_and_type_search(ax_app, wechat_id)
         time.sleep(0.4)
 
-        # Step 2: click "Search WeChat ID" card in More section
-        if not _click_more_card_by_title(ax_app, "Search WeChat ID"):
+        # Step 2: click the "Search WeChat ID" / "Search mobile/QQ ID" card.
+        # WeChat labels the card differently depending on what was typed, and
+        # Qt needs a moment before the result list is populated.
+        def has_search_card() -> bool:
+            try:
+                entries = _collect_search_entries(get_search_list(ax_app))
+            except Exception:
+                return False
+            return any(
+                entry.text.startswith(("Search WeChat ID", "Search mobile/QQ ID", "搜索微信号", "搜索手机号"))
+                for entry in entries
+            )
+
+        wait_until(has_search_card, timeout=3.0, interval=0.25)
+
+        matched_label = None
+        for label in (
+            "Search WeChat ID",
+            "Search mobile/QQ ID",
+            "搜索微信号",
+            "搜索手机号/QQ号",
+        ):
+            if _click_more_card_by_title(ax_app, label):
+                matched_label = label
+                break
+
+        if matched_label is None:
             error_msg = (
-                "Could not find a 'Search WeChat ID' entry in the "
-                "More section of WeChat's global search results."
+                "Could not find a 'Search WeChat ID' or 'Search mobile/QQ ID' "
+                "entry in the global search results. The ID may be invalid, or "
+                "the account cannot be found via search."
             )
             logger.warning(
-                "add_contact_by_wechat_id(%s) failed at Search WeChat ID step",
+                "add_contact_by_wechat_id(%s) failed at search card step",
                 wechat_id,
             )
             return {

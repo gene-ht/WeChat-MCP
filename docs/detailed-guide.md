@@ -1,287 +1,299 @@
 # WeChat MCP Server - Detailed Guide
 
-This document provides detailed information about the WeChat MCP server implementation, architecture, and usage.
+This document describes the tools, architecture, safety model and operational
+details of the WeChat MCP server.
 
 ## Overview
 
-This project provides an MCP server that automates WeChat on macOS using the Accessibility API and screen capture. It exposes tools that LLMs can call to:
+The server automates WeChat for macOS through the Accessibility API and screen
+capture, exposing tools that an LLM client can call to:
 
-- Fetch recent messages for a specific chat (contact or group)
-- Generate and send a reply to a chat based on recent history
+- inspect the current runtime mode and the open conversation;
+- read recent messages from a specific chat;
+- write a reply draft without sending it;
+- send a reply, subject to a deterministic policy gate;
+- add contacts and publish text-only Moments posts.
 
 ## Tools exposed to MCP clients
 
-The server is implemented in `src/wechat_mcp/mcp_server.py` and defines two `@mcp.tool()` functions:
+| Tool | Signature | Purpose |
+| --- | --- | --- |
+| `get_wechat_status` | `() -> dict` | Mode, running state, open chat, allow-list, sends this hour |
+| `set_wechat_mode` | `(mode: str) -> dict` | `active` / `draft_only` / `paused` / `takeover` |
+| `list_wechat_chats` | `() -> list[str]` | Chat names visible in the session list |
+| `fetch_messages_by_chat` | `(chat_name: str, last_n: int = 50) -> list[dict]` | Read recent messages |
+| `draft_reply_to_chat` | `(chat_name: str, reply_message: str) -> dict` | Write the composer, do not send |
+| `reply_to_messages_by_chat` | `(chat_name: str, reply_message: str \| None = None) -> dict` | Send, policy permitting |
+| `add_contact_by_wechat_id` | `(...) -> dict` | Drive the add-contact flow |
+| `publish_moment_without_media` | `(content: str, publish: bool = True) -> dict` | Text-only Moments post |
 
 ### `fetch_messages_by_chat`
 
-**Signature**: `fetch_messages_by_chat(chat_name: str, last_n: int = 50) -> list[dict]`
-
-Opens the chat for `chat_name` (first via the left session list, then via the global search box if needed). When using global search it prefers an **exact name match** in the "Contacts" section, then in the "Group Chats" section, and explicitly ignores matches under "Chat History", "Official Accounts", or "More". If no exact match is found, it does **not** fall back to the top search result; instead it returns a structured error plus up to 15 candidate names from each of "Contacts" and "Group Chats" so the LLM can choose a more specific target. Once a chat is successfully opened, it uses scrolling plus screenshots to collect the **true last** `last_n` messages, even if they span multiple screens of history. Each message is a JSON object:
+Opens the chat for `chat_name` (session list first, then global search),
+preferring an **exact name match** under "Contacts", then "Group Chats", and
+ignoring "Chat History", "Official Accounts", "Internet search results" and
+"More". If no exact match exists it returns up to 15 candidates per section
+instead of guessing. Messages are returned oldest-first:
 
 ```json
-{
-  "sender": "ME" | "OTHER" | "UNKNOWN",
-  "text": "message text"
-}
+{"sender": "ME" | "OTHER" | "UNKNOWN", "text": "message text"}
 ```
+
+Reading scrolls through history, which requires WeChat to be frontmost; the
+message text itself comes from `AXStaticText` values, not OCR. Sender
+attribution is the only part that uses pixels: when WeChat is not frontmost the
+screenshot is skipped and senders are reported as `UNKNOWN` rather than guessed
+from the wrong window.
+
+### `draft_reply_to_chat`
+
+Writes `reply_message` into the chat composer and stops. The text is recorded as
+a pending draft so the human can approve or edit it. If the composer already
+contains different text, the tool refuses (`input_not_empty`) instead of
+clobbering a draft a human may be typing.
 
 ### `reply_to_messages_by_chat`
 
-**Signature**: `reply_to_messages_by_chat(chat_name: str, reply_message: str | null = null) -> dict`
-
-Ensures the chat for `chat_name` is open (skipping an extra click when the current chat already matches), and (optionally) sends the provided `reply_message` using the Accessibility-based `send_message` helper. This tool is intended to be driven by the LLM that is already using this MCP: first call `fetch_messages_by_chat`, then compose a reply, then call this tool with that reply. Returns:
+Sends `reply_message` after the policy gate. Success shape:
 
 ```json
 {
-  "chat_name": "The chat (contact or group)",
-  "reply_message": "The message that was sent (or null)",
-  "sent": true
+  "ok": true,
+  "action": "send_reply",
+  "chat_name": "群名",
+  "sent": true,
+  "verified": true,
+  "method": "axpress",
+  "duration_ms": 812,
+  "mode": "active"
 }
 ```
 
-If an error occurs, the tools return an object containing an `"error"` field describing the issue.
+Refused sends return `{"ok": false, "sent": false, "blocked_reason": "..."}`
+without touching WeChat. Possible reasons:
 
-Internally, `fetch_messages_by_chat` scrolls the WeChat message list using the system's standard macOS scroll semantics (no third‑party scroll reversal tools enabled) and continues scrolling until it has assembled the true last `last_n` messages or reached the beginning of the chat history, rather than stopping after a fixed number of scroll steps.
+| Reason | Meaning |
+| --- | --- |
+| `mode_draft_only` | Server is in draft-only mode |
+| `mode_paused` | Auto-reply is paused |
+| `mode_takeover` | The human owns WeChat |
+| `chat_not_allowed` | Chat is outside `WECHAT_MCP_ALLOWED_CHATS` |
+| `rate_limited` | Hourly send budget exhausted |
+| `duplicate_reply` | Identical to your previous message |
+| `empty_reply` / `reply_too_long` | Text fails validation |
+
+`verified: false` means the keystroke was posted but the reply could not be read
+back from the conversation; it still counts as sent. Sending never retries
+automatically.
 
 ### `add_contact_by_wechat_id`
 
-**Signature**:\
-`add_contact_by_wechat_id(wechat_id: str, friending_msg: str | null = null, remark: str | null = null, tags: str | null = null, privacy: str | null = null, hide_my_posts: bool = false, hide_their_posts: bool = false) -> dict`
+Drives WeChat's "Search WeChat ID" → "Add Contacts" → "Send Friend Request"
+flow: types the ID into global search, clicks the "Search WeChat ID" card,
+presses "Add to Contacts", then optionally fills the friending message, remark
+and privacy options (`all` vs `chats_only`, with the two hide-posts flags).
 
-Adds a new contact using a WeChat ID by driving WeChat’s built‑in “Add Contacts” and “Send Friend Request” flows via the Accessibility API. It:
+### `publish_moment_without_media`
 
-- Types the given `wechat_id` into the global search box via `focus_and_type_search`.
-- In the search results list, finds the **“Search WeChat ID”** card and clicks it.
-- Waits for the **“Add Contacts”** window and clicks the **“Add to Contacts”** button (AXButton with identifier `add_friend_button`).
-- Waits for the **“Send Friend Request”** window and optionally customizes:
-  - The **friending message** (AXTextArea titled `"Send Friend Request"`).
-  - The **remark** (AXTextField titled `"ModifyRemark"`).
-  - The **privacy** section:
-    - `privacy = "all"` (default) selects `"Chats, Moments, WeRun, etc."` and applies:
-      - `hide_my_posts` → checkbox titled `"Hide My Posts"`
-      - `hide_their_posts` → checkbox titled `"Hide Their Posts"`
-    - `privacy = "chats_only"` selects `"Chats Only"` and ignores the hide flags.
-- Finally clicks the **“OK”** button to submit the friend request.
+Opens Moments, long-presses "Post", fills the composer with `content`, and
+publishes unless `publish=False`, in which case the sheet is left open.
 
-On success it returns a JSON object describing the applied settings (including `wechat_id`, `friending_msg`, `remark`, `tags`, `privacy`, and post‑visibility flags). If any step fails (for example the “Search WeChat ID” card is missing or a window does not appear), it returns an object with an `"error"` description, the `wechat_id`, and a `"stage"` field indicating which step failed.
+## Runtime modes and policy
+
+`policy.py` is pure logic over `Settings` + `StateStore`; no AX calls happen
+there, so every rule is unit-testable.
+
+| Mode | Read | Draft | Send |
+| --- | --- | --- | --- |
+| `active` (default) | ✅ | ✅ | ✅ |
+| `draft_only` | ✅ | ✅ | ❌ |
+| `paused` | ✅ | ❌ | ❌ |
+| `takeover` | ❌ | ❌ | ❌ |
+
+The send path evaluates, in order: mode → allow-list → text validity →
+duplicate → hourly rate limit. The cheap checks run before any UI interaction so
+a refusal costs nothing. The duplicate check reads the newest message of the
+target chat first, which is why `ensure_chat` runs before the second evaluation.
 
 ## Architecture
 
-### Core Components
+```
+src/wechat_mcp/
+  mcp_server.py           MCP tools: parse args, call services, map errors
+  services.py             use cases: open / fetch / draft / send (policy, state, audit)
+  policy.py               pure decisions: mode, allow-list, rate limit, duplicates
+  state.py                persisted mode, drafts, send history (atomic JSON)
+  audit.py                append-only JSONL audit log
+  config.py               environment-driven Settings
+  composer.py             composer text + send, focus re-check, read-back verify
+  messages.py             AX message reading, scrolling, sender attribution
+  wechat_accessibility.py WeChat-specific AX navigation (windows, chats, search)
+  ax.py                   generic AX primitives and geometry
+  ui.py                   synthetic input events (keys, clicks, scroll, clipboard)
+  contacts.py             add-contact flow
+  moments.py              Moments flow
+  models.py / errors.py   shared types and typed errors
+```
 
-The project consists of several key modules:
+Call path for a reply:
 
-#### `src/wechat_mcp/mcp_server.py`
+```
+MCP tool -> WeChatService.send_reply
+          -> RuntimePolicy.check_send          (cheap refusal)
+          -> ensure_chat (session list/search)
+          -> messages.read_last_message       (duplicate guard)
+          -> RuntimePolicy.check_send         (with last message)
+          -> composer.send_message
+               -> set_input_value              (refuse to clobber a draft)
+               -> ensure_frontmost             (re-check before Return)
+               -> AXPress send button, or Return
+               -> read-back verification
+          -> StateStore.record_send + AuditLog.record
+```
 
-The main MCP server implementation that:
+### Focus policy
 
-- Creates a `FastMCP` server instance
-- Defines the tool functions decorated with `@mcp.tool()`
-  - `fetch_messages_by_chat(...)`
-  - `reply_to_messages_by_chat(...)`
-  - `add_contact_by_wechat_id(...)`
-- Handles multiple transport types (stdio, streamable-http, sse)
-- Provides the main entry point via the `main()` function
+`ax.py` and `ui.py` know nothing about WeChat. `wechat_accessibility.py` is the
+only module that encodes WeChat's AX identifiers (`session_item_*`,
+`big_title_line_h_view`, `chat_input_field`, `search_list`, ...).
 
-#### `src/wechat_mcp/wechat_accessibility.py`
+Synthetic keystrokes are posted to the HID tap, so they land in whatever window
+is frontmost. Every path that types or clicks therefore calls
+`ensure_frontmost()` first and treats "WeChat did not become frontmost" as an
+error rather than sending input into an unknown window. Read-only helpers pass
+`activate=False` so inspection does not steal focus.
 
-Holds the shared, low-level Accessibility helpers and WeChat UI navigation that are reused by all three tools:
+## Pausing and resuming
 
-**Low-level Accessibility API helpers:**
+Two independent paths:
 
-- `ax_get(element, attribute)` - Get accessibility element attributes
-- `dfs(element, predicate)` - Depth-first search in accessibility tree
-- `click_element_center(element)` - Synthesize mouse click
-- `send_key_with_modifiers(keycode, flags)` - Keyboard input simulation
-- `axvalue_to_point(ax_value)` / `axvalue_to_size(ax_value)` - Convert AXValue wrappers into Python tuples
-- `get_list_center(msg_list)` / `post_scroll(center, delta_lines)` - Compute list center and send scroll-wheel events
+| Who | How | Effect |
+| --- | --- | --- |
+| The agent | `set_wechat_mode("paused")` tool | Immediate |
+| The human | `wechat-mcp --set-mode paused` | Immediate via the control socket |
+| Config | `WECHAT_MCP_MODE=paused` | Applies on start when no state file exists |
+| No server running | `wechat-mcp --set-mode paused` | Persists for the next start |
 
-**WeChat app interaction:**
+The control socket lives at `<state_dir>/control.sock`, is created with mode
+`0600` and speaks one JSON object per line (`{"cmd": "set_mode", "mode": ...}`
+or `{"cmd": "status"}`). Stop the MCP server itself by ending the client
+session (stdio) or removing the server from the MCP configuration.
 
-- `get_wechat_ax_app()` - Get/activate WeChat application
-- `get_current_chat_name()` - Get title of currently open chat
-- `_normalize_chat_title(name)` - Strip group member count suffix like "(23)"
+## State and audit files
 
-**Chat navigation & global search:**
+| File | Contents |
+| --- | --- |
+| `<state_dir>/state.json` | Mode, pending drafts, recent send timestamps |
+| `<state_dir>/audit.jsonl` | One JSON object per action, append-only |
 
-- `collect_chat_elements(ax_app)` / `find_chat_element_by_name(ax_app, chat_name)` - Enumerate and resolve chats in the left session list
-- `open_chat_for_contact(chat_name)` - Open chat with smart fallback behavior:
-  1. First tries sidebar session list
-  2. If not found, uses global search with preference for exact matches
-  3. Prioritizes "Contacts" over "Group Chats"
-  4. Ignores "Chat History", "Official Accounts", "Internet search results"
-  5. Returns error + candidates list if no exact match found
-- `find_search_field(ax_app)` / `focus_and_type_search(ax_app, text)` - Locate WeChat search input and type into it via clipboard + keyboard
-- `get_search_list(ax_app)` - Find search results list
-- `SearchEntry` + `_collect_search_entries(search_list)` - Collect visible rows (section headers, cards, “View All”) with Y positions
-- `_build_section_headers(entries)` / `_classify_section(entry, headers)` - Map entries into "Contacts", "Group Chats", etc.
-- `_find_exact_match_in_entries(entries, contact_name)` - Prefer exact contact/group matches
-- `_summarize_search_candidates(entries)` - Extract up to 15 contact + group names
-- `_expand_section_if_needed(search_list, section_title)` - Click "View All"
-- `_select_contact_from_search_results(ax_app, contact_name)` - Smart search with scrolling that ignores non‑contact sections
-- `_find_window_by_title(ax_app, title)` / `_wait_for_window(ax_app, title)` - Locate and wait for top‑level WeChat windows such as `"Add Contacts"`, `"Send Friend Request"`, or `"Moments"`
-- `click_element_center(element)` / `long_press_element_center(element, hold_seconds)` - Click or long‑press the visual center of an AX element
+`state.json` is written atomically (temp file + `os.replace`), so a crash cannot
+leave a half-written file. Corrupt files are ignored and rebuilt from defaults.
+Audit entries record the chat, mode, decision and duration; the message body is
+hashed (SHA-256 prefix) unless `WECHAT_MCP_AUDIT_TEXT=1`.
 
-#### `src/wechat_mcp/add_contact_by_wechat_id_utils.py`
+## Configuration
 
-Implements the Accessibility flow for adding contacts by WeChat ID:
-
-- `add_contact_by_wechat_id(wechat_id, friending_msg, remark, tags, privacy, hide_my_posts, hide_their_posts)` - Drive the full "Search WeChat ID" → "Add Contacts" → "Send Friend Request" flow.
-- Helper functions:
-  - `_click_more_card_by_title(ax_app, label)` - Click a search result card by its visible label (e.g. `"Search WeChat ID"`)
-  - `_click_add_to_contacts_button(add_contacts_window)` - Press `"Add to Contacts"` in the "Add Contacts" window
-  - `_set_checkbox_state(checkbox, desired)` / `_set_checkbox_by_title(window, title, desired)` - Toggle post‑visibility checkboxes
-  - `_click_privacy_option(window, label)` - Select `"Chats, Moments, WeRun, etc."` vs `"Chats Only"`
-  - `_configure_friend_request_window(...)` - Apply friending message, remark, privacy, and post‑visibility settings in the `"Send Friend Request"` window
-
-#### `src/wechat_mcp/publish_moment_utils.py`
-
-Implements the Accessibility flow for publishing a Moments post without media:
-
-- `publish_moment_without_media(content, publish=True)` - Drive the full `"WeChat" main window` → `"Moments"` window → long‑press `"Post"` → composer sheet → `"Post"` flow for text‑only Moments. When `publish=False`, the composer is filled but the final `"Post"` button is not clicked, leaving the sheet open.
-- Helper functions:
-  - `_open_moments_window(ax_app, timeout)` - Click the `"Moments"` button and wait for the `"Moments"` window
-  - `_open_moment_composer(moments_window)` - Long‑press the `"Post"` button to reveal the composer sheet
-  - `_find_editor_root(moments_window, timeout)` - Prefer the AXSheet composer root, fallback to the `"Moments"` window
-  - `_find_moment_text_area(root)` - Locate the text entry area inside the composer
-  - `_find_post_button_in_editor(root)` - Find the `"Post"` button inside the composer editor root
-
-#### `src/wechat_mcp/fetch_messages_by_chat_utils.py`
-
-Holds the message-list specific logic used by `fetch_messages_by_chat`:
-
-**Message fetching:**
-
-- `get_messages_list(ax_app)` - Find the "Messages" list in the current chat UI
-- `fetch_recent_messages(last_n=100, max_scrolls=None)` - Core algorithm:
-  1. Scrolls to bottom (newest messages)
-  2. Repeatedly scrolls up in small steps
-  3. Captures screenshot of message area at each position
-  4. Collects visible messages and their positions/sizes
-  5. Classifies sender as `"ME"`/`"OTHER"`/`"UNKNOWN"` using pixel analysis
-  6. Merges newly revealed older messages by aligning on anchor text
-  7. Continues until `last_n` messages collected or history exhausted
-- `capture_message_area(msg_list)` - Take screenshot of message area
-- `scroll_to_bottom(msg_list, center)` / `scroll_up_small(center)` - Scroll through message history
-
-**Sender classification:**
-
-- `SenderLabel = Literal["ME", "OTHER", "UNKNOWN"]` - Sender type
-- `ChatMessage` - Dataclass wrapping `sender` + `text` with `.to_dict()`
-- `count_colored_pixels(image, left, top, right, bottom)` - Image processing helper
-- `classify_sender_for_message(image, list_origin, message_pos, message_size)` - Pixel-based heuristic used by `fetch_recent_messages`
-
-#### `src/wechat_mcp/reply_to_messages_by_chat_utils.py`
-
-Contains the helpers used by `reply_to_messages_by_chat` for sending messages:
-
-- `send_message(text)` - Send a message via Accessibility API
-- `find_input_field(ax_app)` - Locate chat input field
-- `press_return()` - Synthesize Return key press
-
-#### `src/wechat_mcp/logging_config.py`
-
-Configures dual logging:
-
-- File handler: writes to `logs/wechat_mcp.log` (DEBUG level)
-- Console handler: writes to stdout (INFO level)
-- Customizable via `WECHAT_MCP_LOG_DIR` environment variable
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `WECHAT_MCP_MODE` | `active` | Runtime mode |
+| `WECHAT_MCP_ALLOWED_CHATS` | *(empty = all)* | Comma-separated chat allow-list |
+| `WECHAT_MCP_MAX_SENDS_PER_HOUR` | `30` | Sliding-window limit |
+| `WECHAT_MCP_MAX_REPLY_CHARS` | `2000` | Maximum reply length |
+| `WECHAT_MCP_VERIFY_SENDS` | `1` | Read back after sending |
+| `WECHAT_MCP_ALLOW_DUPLICATE` | `0` | Allow identical consecutive text |
+| `WECHAT_MCP_AUDIT_TEXT` | `0` | Plaintext bodies in the audit log |
+| `WECHAT_MCP_STATE_DIR` | `~/.local/state/wechat-mcp` | State and audit directory |
+| `WECHAT_MCP_LOG_DIR` | `logs` | Server log directory |
+| `WECHAT_MCP_HUMANIZE` | `1` | Human-like pacing between UI actions |
+| `WECHAT_MCP_MIN_DELAY` / `WECHAT_MCP_MAX_DELAY` | `0.25` / `0.90` | Jittered pause range in seconds |
 
 ## Logging
 
-The project has a comprehensive logging setup:
-
-- Logs are written to a file under the `logs/` directory (by default `logs/wechat_mcp.log`)
-- Logs are also sent to the terminal (stdout)
-
-You can customize the log directory via:
-
-- `WECHAT_MCP_LOG_DIR` – directory path where `.log` files should be stored (defaults to `logs` under the current working directory)
+- File handler: `logs/wechat_mcp.log` (DEBUG)
+- Console handler: stdout (INFO)
+- `WECHAT_MCP_LOG_DIR` overrides the directory
+- `--mcp-debug` raises MCP/anyio/httpx loggers to DEBUG
 
 ## macOS and Accessibility requirements
 
-Because this project interacts with WeChat via the macOS Accessibility API:
-
-- WeChat must be running (`com.tencent.xinWeChat`)
-- The Python process (or the terminal app running it) must have Accessibility permissions enabled in **System Settings → Privacy & Security → Accessibility**
-
-The helper scripts and MCP tools rely on:
-
-- Accessibility tree inspection to find chat lists, search fields, and message lists
-- Screen capture to classify message senders (`ME` vs `OTHER` vs `UNKNOWN`)
-- Synthetic keyboard events to search, focus inputs, and send messages
+- WeChat must be running (`com.tencent.xinWeChat`).
+- The hosting process (terminal, IDE or DSH) needs **Accessibility** permission
+  in System Settings → Privacy & Security → Accessibility.
+- **Screen Recording** is needed only for sender attribution.
 
 ## Dependencies
 
-From `pyproject.toml`:
-
 ```
-pyobjc >= 12.1                          # macOS accessibility bridge
-pyobjc-framework-applicationservices   # Accessibility frameworks
-pillow >= 10.0.0                        # Image processing for sender detection
-mcp[cli] >= 1.0.0                       # MCP server framework
+pyobjc >= 12.1
+pyobjc-framework-applicationservices >= 12.1
+pillow >= 10.0.0
+mcp[cli] >= 1.0.0, < 2.0    # FastMCP lives in mcp.server.fastmcp on 1.x
 ```
 
-## Supported Transports
+## Supported transports
 
-The MCP server supports multiple transport protocols:
-
-- **stdio** (default) - Standard input/output for local process communication
-- **streamable-http** - HTTP-based streaming transport
-- **sse** - Server-Sent Events transport
-
-Example usage:
+- **stdio** (default)
+- **streamable-http**
+- **sse**
 
 ```bash
-# stdio (default)
 wechat-mcp --transport stdio
-
-# HTTP streaming
 wechat-mcp --transport streamable-http
-
-# Server-Sent Events
 wechat-mcp --transport sse
+wechat-mcp --set-mode draft_only
 ```
 
 ## Development
 
-For local development using `uv`:
-
 ```bash
-# Install uv
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Sync environment
-cd WeChat-MCP
 uv sync
-
-# Run the server
 uv run wechat-mcp --transport stdio
+
+# unit tests, no WeChat needed
+uv run pytest
+
+# live smoke tests, opt-in
+WECHAT_MCP_LIVE=1 WECHAT_MCP_LIVE_CHAT="文件传输助手" uv run pytest tests/test_live.py -m live -s
 ```
+
+Tests never touch the real Accessibility API unless marked `live`;
+`tests/test_composer.py` patches the AX layer, and `tests/test_services.py`
+patches the WeChat navigator.
 
 ## Troubleshooting
 
-### Accessibility Permissions
+### Accessibility permissions
 
-If you get errors about accessibility permissions:
+1. System Settings → Privacy & Security → Accessibility.
+2. Add the terminal application.
+3. Enable its checkbox and restart the terminal.
 
-1. Open **System Settings → Privacy & Security → Accessibility**
-2. Add your terminal application (Terminal.app, iTerm2, etc.)
-3. Enable the checkbox for that application
-4. Restart your terminal
+### WeChat not found
 
-### WeChat Not Found
+Start WeChat before the server. Bundle id: `com.tencent.xinWeChat`.
 
-Make sure WeChat is running before starting the MCP server. The bundle identifier is `com.tencent.xinWeChat`.
+### "WeChat did not become frontmost"
 
-### Search Not Finding Contacts
+Another app grabbed focus between activation and the keystroke. The send is
+aborted by design; retry once the machine is idle, or switch to `draft_only` and
+send manually.
 
-The search implementation prefers exact matches. If a contact name is not found:
+### `ax_tree_ok: false` / "only exposes its window frame"
 
-1. The server will return a list of similar candidates
-2. The LLM can choose the correct one from the list
-3. Make sure the contact name matches exactly (case-insensitive)
+WeChat 4.1.x builds on recent macOS releases can run as a Qt client whose chat
+UI is not published to the Accessibility API. `get_wechat_status` reports the
+element count and the client version; a healthy client exposes dozens of
+elements, a broken one exposes about a dozen (window frame + traffic lights).
+
+There is no code fix on this side: the UI tree is simply absent. Options are to
+use WeChat 3.8.x, or to drive the 4.x client through its keyboard shortcuts /
+screenshots instead of AX. The server refuses to guess rather than clicking
+blind.
+
+### Sends return `blocked_reason`
+
+Check `get_wechat_status` for the mode and allow-list, and the audit log for the
+decision. Do not retry the same call in a loop.
 
 ## TODO
 
@@ -289,7 +301,9 @@ The search implementation prefers exact matches. If a contact name is not found:
 - [x] Scroll to get full/more history messages
 - [x] Prefer exact match in Contacts/Group Chats search results
 - [x] Add contact using WeChat ID
-- [x] Refactor wechat accessibility codebase
+- [x] Refactor the accessibility codebase
+- [x] Runtime modes, allow-list, duplicate/rate guards and audit log
+- [x] Post-send read-back verification
 - [ ] Edit contact/group chat info
 - [x] Publish moment w/o media
 - [ ] Fetch moments by chat name

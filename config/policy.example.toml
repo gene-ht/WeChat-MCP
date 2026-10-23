@@ -1,0 +1,20 @@
+# Policy limits and reply pacing.
+# Copy to artifacts/config/policy.toml and adjust per account.
+
+[messages]
+# Outbound chat replies per rolling hour. 0 = unlimited.
+max_per_hour = 30
+
+[friend_request]
+# Friend requests are more sensitive than messages: keep them slow.
+max_per_minute = 1
+max_per_day = 100
+
+[reply_pacing]
+# Human-like rhythm for every outgoing message.
+enabled = true
+thinking_min = 1.0            # seconds spent "reading/deciding"
+thinking_max = 2.8
+typing_chars_per_second = 7.0 # 20 chars ≈ 2.9s of typing
+min_delay = 0.25              # jittered gap between UI actions
+max_delay = 0.90

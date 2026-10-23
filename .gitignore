@@ -12,5 +12,15 @@ wheels/
 # Logging
 logs/
 
+# Local runtime state
+.wechat-state/
+
 # node_modules
 node_modules/
+
+# Personal outreach copy (keep the example tracked)
+config/outreach.toml
+
+# Private runtime data: state, audits, leads, job data, local configs.
+# See Artifacts.md; never commit or package this directory.
+artifacts/
